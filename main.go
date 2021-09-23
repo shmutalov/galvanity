@@ -134,7 +134,7 @@ func main() {
 
 	startedTime := time.Now()
 	counter := make(chan uint64)
-	for i := 0; i < runtime.NumCPU()-1; i++ {
+	for i := 0; i < runtime.NumCPU(); i++ {
 		go func(pat string) {
 			var i uint64
 			for {
