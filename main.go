@@ -21,6 +21,7 @@ search-type is matching function to search for pattern, it can be:
   starts   - 1: search address which starts with given pattern
   ends     - 2: search address which ends with given pattern
   contains - 3: search address which contains given pattern at any place
+pattern is correct **BASE32** hash string, alphabet is [A-Z] and [2-7]
 
 Go to https://github.com/shmutalov/goalvanity to download the latest source code`
 
