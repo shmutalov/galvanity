@@ -1,3 +1,5 @@
+[![build](https://github.com/shmutalov/galvanity/actions/workflows/go.yml/badge.svg)](https://github.com/shmutalov/galvanity/actions/workflows/go.yml)
+
 # Galvanity
 
 Galvanity is Algorand vanity address generator written in Go
