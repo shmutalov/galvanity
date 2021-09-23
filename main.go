@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -152,11 +153,11 @@ MNEMONIC: %s
 `, account.Address, account.PublicKey, account.PrivateKey, words)
 				}
 
+				i++
 				if i%100 == 0 {
 					counter <- i
+					i = 0
 				}
-
-				i++
 				runtime.Gosched()
 			}
 		}(pattern)
@@ -168,16 +169,17 @@ MNEMONIC: %s
 	for {
 		select {
 		case x := <-counter:
-			total += x
+			atomic.AddUint64(&total, x)
+
 			if total%1_000_000 == 0 {
 				if total == 0 {
 					continue
 				}
 
 				now := time.Now()
-				speed := (float64(total-oldTotal) / now.Sub(oldTime).Seconds()) / 1_000_000
+				speed := (float64(total-oldTotal) / now.Sub(oldTime).Seconds()) / 1_000
 
-				fmt.Printf("Processed: %d MH Speed: %.2f MH/s Time elapsed: %.2f s\n",
+				fmt.Printf("Processed: %d MH Speed: %.2f KH/s Time elapsed: %.2f s\n",
 					total/1_000_000, speed, now.Sub(startedTime).Seconds())
 
 				oldTotal = total
