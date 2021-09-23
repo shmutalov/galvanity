@@ -1,4 +1,4 @@
-[![build](https://github.com/shmutalov/galvanity/actions/workflows/go.yml/badge.svg)](https://github.com/shmutalov/galvanity/actions/workflows/go.yml)
+[![build](https://github.com/shmutalov/galvanity/actions/workflows/build.yml/badge.svg)](https://github.com/shmutalov/galvanity/actions/workflows/build.yml)
 
 # Galvanity
 
