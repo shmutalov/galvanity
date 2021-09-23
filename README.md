@@ -69,6 +69,11 @@ After successful build, it will produce `galvanity` (or `galvanity.exe` on Windo
 
 Check pre-built binaries at [**build-action**](https://github.com/shmutalov/galvanity/actions/workflows/build.yml) page, select the latest successful build, scroll down and download the needed artifacts.
 
+# TODO
+
+- [ ] Add the `threads` parameter
+- [ ] Implement the GPU-side generator
+
 # License
 
 Galvanity is distributed under the terms GNU General Public License (Version 3).
