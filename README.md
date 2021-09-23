@@ -53,6 +53,22 @@ MNEMONIC: injury author distance flash evolve joy armed shaft motion extra choos
 
 ```
 
+# Build
+
+To build the Galvanity, you need to download and install the Go compiler (I tested with 1.15 version).
+
+Then just run the following command in the source code directory:
+
+```
+go build
+```
+
+After successful build, it will produce `galvanity` (or `galvanity.exe` on Windows OS) named binary file
+
+# Pre-built binaries
+
+Check pre-built binaries at [**build-action**](https://github.com/shmutalov/galvanity/actions/workflows/build.yml) page, select the latest successful build, scroll down and download the needed artifacts.
+
 # License
 
 Galvanity is distributed under the terms GNU General Public License (Version 3).
