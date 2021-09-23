@@ -1,4 +1,4 @@
-module goalvanity
+module galvanity
 
 go 1.15
 

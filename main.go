@@ -15,7 +15,7 @@ import (
 
 func printHelp() {
 	help := `
-Usage: goalvanity [search-type] <pattern>
+Usage: galvanity [search-type] <pattern>
 search-type is matching function to search for pattern, it can be:
   exact    - 0: search exact pattern (full address string)
   starts   - 1: search address which starts with given pattern
@@ -33,6 +33,20 @@ const (
 	searchTypeEndsWith
 	searchTypeContains
 )
+
+var searchTypes = map[string]int{
+	"exact":    searchTypeExact,
+	"starts":   searchTypeStartsWith,
+	"ends":     searchTypeEndsWith,
+	"contains": searchTypeContains,
+}
+
+var searchTypeStrings = map[int]string{
+	searchTypeExact:      "exact",
+	searchTypeStartsWith: "starts",
+	searchTypeEndsWith:   "ends",
+	searchTypeContains:   "contains",
+}
 
 func verifyPattern(pattern string) bool {
 	if ok, err := regexp.MatchString("^[A-Z2-7]+$", pattern); err == nil {
@@ -59,16 +73,9 @@ func processArgs() (string, int, bool) {
 		return "", 0, false
 	}
 
-	switch strings.ToLower(os.Args[1]) {
-	case "exact":
-		return pattern, searchTypeExact, true
-	case "starts":
-		return pattern, searchTypeStartsWith, true
-	case "ends":
-		return pattern, searchTypeEndsWith, true
-	case "contains":
-		return pattern, searchTypeContains, true
-	default:
+	if searchType, ok := searchTypes[strings.ToLower(os.Args[1])]; ok {
+		return pattern, searchType, true
+	} else {
 		fmt.Println("Invalid search type")
 		return "", 0, false
 	}
@@ -112,7 +119,7 @@ func main() {
 	}
 
 	fmt.Printf("Pattern to find: %s\n", pattern)
-	fmt.Printf("Search type: %d\n", searchType)
+	fmt.Printf("Search type: %s\n", searchTypeStrings[searchType])
 
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -132,8 +139,16 @@ func main() {
 				account := crypto.GenerateAccount()
 				if matcherFn(account.Address.String(), pat) {
 					words, _ := mnemonic.FromPrivateKey(account.PrivateKey)
-					fmt.Printf("\n==== ==== ====\nFound ADDR: %s\nPUB: %v\nPK: %v\nMNEMONIC: %s\n==== ==== ====\n\n",
-						account.Address, account.PublicKey, account.PrivateKey, words)
+					fmt.Printf(
+						`
+==== ==== ====
+Found ADDR: %s
+PUB: %v
+PK: %v
+MNEMONIC: %s
+==== ==== ====
+
+`, account.Address, account.PublicKey, account.PrivateKey, words)
 				}
 
 				if i%100 == 0 {
