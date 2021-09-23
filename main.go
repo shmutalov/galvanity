@@ -3,16 +3,116 @@ package main
 import (
 	"fmt"
 	"github.com/algorand/go-algorand-sdk/crypto"
+	"github.com/algorand/go-algorand-sdk/mnemonic"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
 )
 
+func printHelp() {
+	help := `
+Usage: goalvanity [search-type] <pattern>
+search-type is matching function to search for pattern, it can be:
+  exact    - 0: search exact pattern (full address string)
+  starts   - 1: search address which starts with given pattern
+  ends     - 2: search address which ends with given pattern
+  contains - 3: search address which contains given pattern at any place
+
+Go to https://github.com/shmutalov/goalvanity to download the latest source code`
+
+	fmt.Println(help)
+}
+
+const (
+	searchTypeExact = iota
+	searchTypeStartsWith
+	searchTypeEndsWith
+	searchTypeContains
+)
+
+func verifyPattern(pattern string) bool {
+	if ok, err := regexp.MatchString("^[A-Z2-7]+$", pattern); err == nil {
+		return ok
+	} else {
+		return false
+	}
+}
+
+func processArgs() (string, int, bool) {
+	if len(os.Args) == 1 {
+		fmt.Println("Not enough arguments")
+		return "", 0, false
+	}
+
+	if len(os.Args) == 2 {
+		return os.Args[1], searchTypeContains, true
+	}
+
+	// verify pattern that matches to base32 format
+	pattern := strings.ToUpper(os.Args[2])
+	if ok := verifyPattern(pattern); !ok {
+		fmt.Println("Invalid pattern, must match to the BASE32 format: only A-Z and 2-7 (excluding 0/zero, 1/one, 8/eight and 9/nine)")
+		return "", 0, false
+	}
+
+	switch strings.ToLower(os.Args[1]) {
+	case "exact":
+		return pattern, searchTypeExact, true
+	case "starts":
+		return pattern, searchTypeStartsWith, true
+	case "ends":
+		return pattern, searchTypeEndsWith, true
+	case "contains":
+		return pattern, searchTypeContains, true
+	default:
+		fmt.Println("Invalid search type")
+		return "", 0, false
+	}
+}
+
+func matchFunc(searchType int) (func(string, string) bool, bool) {
+	switch searchType {
+	case searchTypeExact:
+		return func(address string, pattern string) bool {
+			return address == pattern
+		}, true
+	case searchTypeStartsWith:
+		return func(address string, pattern string) bool {
+			return strings.HasPrefix(address, pattern)
+		}, true
+	case searchTypeEndsWith:
+		return func(address string, pattern string) bool {
+			return strings.HasSuffix(address, pattern)
+		}, true
+	case searchTypeContains:
+		return func(address string, pattern string) bool {
+			return strings.Contains(address, pattern)
+		}, true
+	default:
+		fmt.Println("Unknown error, cannot determine a match-function")
+		return nil, false
+	}
+}
+
 func main() {
-	fmt.Printf("CPU: %d\n", runtime.NumCPU())
+	pattern, searchType, ok := processArgs()
+	if !ok {
+		printHelp()
+		return
+	}
+
+	matcherFn, ok := matchFunc(searchType)
+	if !ok {
+		printHelp()
+		return
+	}
+
+	fmt.Printf("Pattern to find: %s\n", pattern)
+	fmt.Printf("Search type: %d\n", searchType)
 
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -21,21 +121,19 @@ func main() {
 		os.Exit(1)
 	}()
 
-	fmt.Println("Crunching started...")
+	fmt.Println("Matching started...")
 
 	startedTime := time.Now()
 	counter := make(chan uint64)
 	for i := 0; i < runtime.NumCPU()-1; i++ {
-		address := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ"
-		go func(addr string) {
+		go func(pat string) {
 			var i uint64
 			for {
 				account := crypto.GenerateAccount()
-				// if account.Address.String() == addr {
-				if strings.HasPrefix(account.Address.String(), "AAAAA") {
-					fmt.Printf("FOUND ADDR: %s\nPUB: %v\nPK: %v\n", account.Address, account.PublicKey, account.PrivateKey)
-					c <- os.Interrupt
-					return
+				if matcherFn(account.Address.String(), pat) {
+					words, _ := mnemonic.FromPrivateKey(account.PrivateKey)
+					fmt.Printf("\n==== ==== ====\nFound ADDR: %s\nPUB: %v\nPK: %v\nMNEMONIC: %s\n==== ==== ====\n\n",
+						account.Address, account.PublicKey, account.PrivateKey, words)
 				}
 
 				if i%100 == 0 {
@@ -45,7 +143,7 @@ func main() {
 				i++
 				runtime.Gosched()
 			}
-		}(address)
+		}(pattern)
 	}
 
 	var total uint64
@@ -56,10 +154,16 @@ func main() {
 		case x := <-counter:
 			total += x
 			if total%1_000_000 == 0 {
-				now := time.Now()
-				speed := float64(total-oldTotal) / now.Sub(oldTime).Seconds()
+				if total == 0 {
+					continue
+				}
 
-				fmt.Printf("PARSED: %d SPEED %d/s ELAPSED: %f s\n", total, uint64(speed), now.Sub(startedTime).Seconds())
+				now := time.Now()
+				speed := (float64(total-oldTotal) / now.Sub(oldTime).Seconds()) / 1_000_000
+
+				fmt.Printf("Processed: %d MH Speed: %.2f MH/s Time elapsed: %.2f s\n",
+					total/1_000_000, speed, now.Sub(startedTime).Seconds())
+
 				oldTotal = total
 				oldTime = time.Now()
 			}
