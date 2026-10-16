@@ -1,0 +1,670 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Galvanity Vulkan cruncher.
+//
+// Every invocation derives Algorand accounts and checks their address against
+// the search pattern. Candidate number idx is fully determined by the host's
+// secret ChaCha20 key, so the host can re-derive (and independently verify)
+// any reported hit from idx alone:
+//
+//   seed    = ChaCha20(key, counter = lo32(idx), nonce = hi32(idx) || nonce)[0:32]
+//   scalar  = clamp(SHA-512(seed)[0:32])                  (RFC 8032 key expansion)
+//   pubkey  = encode(scalar * B)                           (ed25519 public key)
+//   address = base32(pubkey || SHA-512/256(pubkey)[28:32])  (58 characters)
+//
+// Field and group arithmetic is a port of the ref10 ed25519 implementation
+// (10 signed limbs, radix 2^25.5, 64-bit products).
+//
+// Rebuild cruncher.spv after editing: go generate (needs glslc from the Vulkan SDK).
+
+// The workgroup size is set by the host (gpuWorkgroupSize) at pipeline creation.
+layout(local_size_x_id = 0) in;
+
+// Precomputed multiples of the base point, see ge_scalarmult_base.
+layout(std430, set = 0, binding = 0) readonly buffer BaseTable { ivec4 base_table[]; };
+
+layout(std430, set = 0, binding = 1) readonly buffer Params {
+    uint key[8];
+    uint nonce[2];
+    uint search_type;
+    uint pattern_len;
+    uint mode;
+    uint max_hits;
+    uint pattern[58]; // base32 symbol values, 0..31
+};
+
+layout(std430, set = 0, binding = 2) buffer Results {
+    uint hit_count; // total matches, may exceed max_hits
+    uint results_pad;
+    uvec2 hits[];   // candidate indices (lo, hi) of the first max_hits matches
+};
+
+// MODE_DUMP output: 9 words (36 address bytes) per candidate. Used by tests.
+layout(std430, set = 0, binding = 3) writeonly buffer Dump { uint dump[]; };
+
+layout(push_constant) uniform Push {
+    uint base_lo;    // index of the first candidate in this dispatch
+    uint base_hi;
+    uint iterations; // loop iterations per invocation, BATCH candidates each
+} pc;
+
+const uint SEARCH_EXACT = 0u;
+const uint SEARCH_STARTS = 1u;
+const uint SEARCH_ENDS = 2u;
+const uint SEARCH_CONTAINS = 3u;
+
+const uint MODE_SEARCH = 0u;
+const uint MODE_DUMP = 1u;
+
+const uint ADDRESS_SYMBOLS = 58u;
+const uint PUBKEY_SYMBOLS = 51u; // symbols 0..50 do not depend on the checksum
+
+// ---------------------------------------------------------------------------
+// GF(2^255 - 19)
+
+void fe_0(out int h[10]) {
+    [[unroll]] for (int i = 0; i < 10; i++) h[i] = 0;
+}
+
+void fe_1(out int h[10]) {
+    fe_0(h);
+    h[0] = 1;
+}
+
+void fe_add(out int h[10], int f[10], int g[10]) {
+    [[unroll]] for (int i = 0; i < 10; i++) h[i] = f[i] + g[i];
+}
+
+void fe_sub(out int h[10], int f[10], int g[10]) {
+    [[unroll]] for (int i = 0; i < 10; i++) h[i] = f[i] - g[i];
+}
+
+void fe_combine(out int h[10], int64_t h0, int64_t h1, int64_t h2, int64_t h3, int64_t h4,
+                int64_t h5, int64_t h6, int64_t h7, int64_t h8, int64_t h9) {
+    int64_t c;
+    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
+    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
+    c = (h1 + (1L << 24)) >> 25; h2 += c; h1 -= c << 25;
+    c = (h5 + (1L << 24)) >> 25; h6 += c; h5 -= c << 25;
+    c = (h2 + (1L << 25)) >> 26; h3 += c; h2 -= c << 26;
+    c = (h6 + (1L << 25)) >> 26; h7 += c; h6 -= c << 26;
+    c = (h3 + (1L << 24)) >> 25; h4 += c; h3 -= c << 25;
+    c = (h7 + (1L << 24)) >> 25; h8 += c; h7 -= c << 25;
+    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
+    c = (h8 + (1L << 25)) >> 26; h9 += c; h8 -= c << 26;
+    c = (h9 + (1L << 24)) >> 25; h0 += c * 19L; h9 -= c << 25;
+    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
+    h[0] = int(h0); h[1] = int(h1); h[2] = int(h2); h[3] = int(h3); h[4] = int(h4);
+    h[5] = int(h5); h[6] = int(h6); h[7] = int(h7); h[8] = int(h8); h[9] = int(h9);
+}
+
+void fe_mul(out int h[10], int f[10], int g[10]) {
+    int64_t f0 = int64_t(f[0]), f1 = int64_t(f[1]), f2 = int64_t(f[2]), f3 = int64_t(f[3]), f4 = int64_t(f[4]);
+    int64_t f5 = int64_t(f[5]), f6 = int64_t(f[6]), f7 = int64_t(f[7]), f8 = int64_t(f[8]), f9 = int64_t(f[9]);
+    int64_t f1_2 = int64_t(2 * f[1]), f3_2 = int64_t(2 * f[3]), f5_2 = int64_t(2 * f[5]);
+    int64_t f7_2 = int64_t(2 * f[7]), f9_2 = int64_t(2 * f[9]);
+    int64_t g0 = int64_t(g[0]), g1 = int64_t(g[1]), g2 = int64_t(g[2]), g3 = int64_t(g[3]), g4 = int64_t(g[4]);
+    int64_t g5 = int64_t(g[5]), g6 = int64_t(g[6]), g7 = int64_t(g[7]), g8 = int64_t(g[8]), g9 = int64_t(g[9]);
+    int64_t g1_19 = int64_t(19 * g[1]), g2_19 = int64_t(19 * g[2]), g3_19 = int64_t(19 * g[3]);
+    int64_t g4_19 = int64_t(19 * g[4]), g5_19 = int64_t(19 * g[5]), g6_19 = int64_t(19 * g[6]);
+    int64_t g7_19 = int64_t(19 * g[7]), g8_19 = int64_t(19 * g[8]), g9_19 = int64_t(19 * g[9]);
+
+    int64_t h0 = f0*g0 + f1_2*g9_19 + f2*g8_19 + f3_2*g7_19 + f4*g6_19 + f5_2*g5_19 + f6*g4_19 + f7_2*g3_19 + f8*g2_19 + f9_2*g1_19;
+    int64_t h1 = f0*g1 + f1*g0 + f2*g9_19 + f3*g8_19 + f4*g7_19 + f5*g6_19 + f6*g5_19 + f7*g4_19 + f8*g3_19 + f9*g2_19;
+    int64_t h2 = f0*g2 + f1_2*g1 + f2*g0 + f3_2*g9_19 + f4*g8_19 + f5_2*g7_19 + f6*g6_19 + f7_2*g5_19 + f8*g4_19 + f9_2*g3_19;
+    int64_t h3 = f0*g3 + f1*g2 + f2*g1 + f3*g0 + f4*g9_19 + f5*g8_19 + f6*g7_19 + f7*g6_19 + f8*g5_19 + f9*g4_19;
+    int64_t h4 = f0*g4 + f1_2*g3 + f2*g2 + f3_2*g1 + f4*g0 + f5_2*g9_19 + f6*g8_19 + f7_2*g7_19 + f8*g6_19 + f9_2*g5_19;
+    int64_t h5 = f0*g5 + f1*g4 + f2*g3 + f3*g2 + f4*g1 + f5*g0 + f6*g9_19 + f7*g8_19 + f8*g7_19 + f9*g6_19;
+    int64_t h6 = f0*g6 + f1_2*g5 + f2*g4 + f3_2*g3 + f4*g2 + f5_2*g1 + f6*g0 + f7_2*g9_19 + f8*g8_19 + f9_2*g7_19;
+    int64_t h7 = f0*g7 + f1*g6 + f2*g5 + f3*g4 + f4*g3 + f5*g2 + f6*g1 + f7*g0 + f8*g9_19 + f9*g8_19;
+    int64_t h8 = f0*g8 + f1_2*g7 + f2*g6 + f3_2*g5 + f4*g4 + f5_2*g3 + f6*g2 + f7_2*g1 + f8*g0 + f9_2*g9_19;
+    int64_t h9 = f0*g9 + f1*g8 + f2*g7 + f3*g6 + f4*g5 + f5*g4 + f6*g3 + f7*g2 + f8*g1 + f9*g0;
+
+    fe_combine(h, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9);
+}
+
+// Unreduced f^2 (scaled by 2 when dbl is set), shared by fe_sq and fe_sq2.
+void fe_sq_inner(out int h[10], int f[10], bool dbl) {
+    int64_t f0 = int64_t(f[0]), f1 = int64_t(f[1]), f2 = int64_t(f[2]), f3 = int64_t(f[3]), f4 = int64_t(f[4]);
+    int64_t f5 = int64_t(f[5]), f6 = int64_t(f[6]), f7 = int64_t(f[7]), f8 = int64_t(f[8]), f9 = int64_t(f[9]);
+    int64_t f0_2 = int64_t(2 * f[0]), f1_2 = int64_t(2 * f[1]), f2_2 = int64_t(2 * f[2]), f3_2 = int64_t(2 * f[3]);
+    int64_t f4_2 = int64_t(2 * f[4]), f5_2 = int64_t(2 * f[5]), f6_2 = int64_t(2 * f[6]), f7_2 = int64_t(2 * f[7]);
+    // Premultiplied in 32 bits, as in ref10's C code, so every product below is
+    // a 32x32->64 multiply instead of a full 64x64 one. Exact: inputs are
+    // fe_combine outputs (|even| <= 2^25, |odd| <= 2^24 + 2^18) or the sum of
+    // two (ge_p2_dbl's X+Y), so 19*f[even] and 38*f[odd] stay below 1.22*2^30.
+    int64_t f5_38 = int64_t(38 * f[5]), f6_19 = int64_t(19 * f[6]), f7_38 = int64_t(38 * f[7]);
+    int64_t f8_19 = int64_t(19 * f[8]), f9_38 = int64_t(38 * f[9]);
+
+    int64_t h0 = f0*f0 + f1_2*f9_38 + f2_2*f8_19 + f3_2*f7_38 + f4_2*f6_19 + f5*f5_38;
+    int64_t h1 = f0_2*f1 + f2*f9_38 + f3_2*f8_19 + f4*f7_38 + f5_2*f6_19;
+    int64_t h2 = f0_2*f2 + f1_2*f1 + f3_2*f9_38 + f4_2*f8_19 + f5_2*f7_38 + f6*f6_19;
+    int64_t h3 = f0_2*f3 + f1_2*f2 + f4*f9_38 + f5_2*f8_19 + f6*f7_38;
+    int64_t h4 = f0_2*f4 + f1_2*f3_2 + f2*f2 + f5_2*f9_38 + f6_2*f8_19 + f7*f7_38;
+    int64_t h5 = f0_2*f5 + f1_2*f4 + f2_2*f3 + f6*f9_38 + f7_2*f8_19;
+    int64_t h6 = f0_2*f6 + f1_2*f5_2 + f2_2*f4 + f3_2*f3 + f7_2*f9_38 + f8*f8_19;
+    int64_t h7 = f0_2*f7 + f1_2*f6 + f2_2*f5 + f3_2*f4 + f8*f9_38;
+    int64_t h8 = f0_2*f8 + f1_2*f7_2 + f2_2*f6 + f3_2*f5_2 + f4*f4 + f9*f9_38;
+    int64_t h9 = f0_2*f9 + f1_2*f8 + f2_2*f7 + f3_2*f6 + f4_2*f5;
+
+    if (dbl) {
+        h0 += h0; h1 += h1; h2 += h2; h3 += h3; h4 += h4;
+        h5 += h5; h6 += h6; h7 += h7; h8 += h8; h9 += h9;
+    }
+    fe_combine(h, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9);
+}
+
+void fe_sq(out int h[10], int f[10]) { fe_sq_inner(h, f, false); }
+
+void fe_sq2(out int h[10], int f[10]) { fe_sq_inner(h, f, true); }
+
+void fe_invert(out int o[10], int z[10]) {
+    int t0[10], t1[10], t2[10], t3[10];
+    fe_sq(t0, z);
+    fe_sq(t1, t0);
+    fe_sq(t1, t1);
+    fe_mul(t1, z, t1);
+    fe_mul(t0, t0, t1);
+    fe_sq(t2, t0);
+    fe_mul(t1, t1, t2);
+    fe_sq(t2, t1);
+    for (int i = 1; i < 5; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for (int i = 1; i < 10; i++) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for (int i = 1; i < 20; i++) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    fe_sq(t2, t2);
+    for (int i = 1; i < 10; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t2, t1);
+    for (int i = 1; i < 50; i++) fe_sq(t2, t2);
+    fe_mul(t2, t2, t1);
+    fe_sq(t3, t2);
+    for (int i = 1; i < 100; i++) fe_sq(t3, t3);
+    fe_mul(t2, t3, t2);
+    fe_sq(t2, t2);
+    for (int i = 1; i < 50; i++) fe_sq(t2, t2);
+    fe_mul(t1, t2, t1);
+    fe_sq(t1, t1);
+    for (int i = 1; i < 5; i++) fe_sq(t1, t1);
+    fe_mul(o, t1, t0);
+}
+
+// Canonical little-endian encoding of h as eight 32-bit words (ref10 fe_tobytes).
+void fe_pack(out uint w[8], int h[10]) {
+    int q = (19 * h[9] + (1 << 24)) >> 25;
+    q = (h[0] + q) >> 26;
+    q = (h[1] + q) >> 25;
+    q = (h[2] + q) >> 26;
+    q = (h[3] + q) >> 25;
+    q = (h[4] + q) >> 26;
+    q = (h[5] + q) >> 25;
+    q = (h[6] + q) >> 26;
+    q = (h[7] + q) >> 25;
+    q = (h[8] + q) >> 26;
+    q = (h[9] + q) >> 25;
+    h[0] += 19 * q;
+
+    int c;
+    c = h[0] >> 26; h[1] += c; h[0] -= c << 26;
+    c = h[1] >> 25; h[2] += c; h[1] -= c << 25;
+    c = h[2] >> 26; h[3] += c; h[2] -= c << 26;
+    c = h[3] >> 25; h[4] += c; h[3] -= c << 25;
+    c = h[4] >> 26; h[5] += c; h[4] -= c << 26;
+    c = h[5] >> 25; h[6] += c; h[5] -= c << 25;
+    c = h[6] >> 26; h[7] += c; h[6] -= c << 26;
+    c = h[7] >> 25; h[8] += c; h[7] -= c << 25;
+    c = h[8] >> 26; h[9] += c; h[8] -= c << 26;
+    c = h[9] >> 25; h[9] -= c << 25;
+
+    // Limb i sits at bit ceil(25.5 * i).
+    w[0] = uint(h[0]) | (uint(h[1]) << 26);
+    w[1] = (uint(h[1]) >> 6) | (uint(h[2]) << 19);
+    w[2] = (uint(h[2]) >> 13) | (uint(h[3]) << 13);
+    w[3] = (uint(h[3]) >> 19) | (uint(h[4]) << 6);
+    w[4] = uint(h[5]) | (uint(h[6]) << 25);
+    w[5] = (uint(h[6]) >> 7) | (uint(h[7]) << 19);
+    w[6] = (uint(h[7]) >> 13) | (uint(h[8]) << 12);
+    w[7] = (uint(h[8]) >> 20) | (uint(h[9]) << 6);
+}
+
+// ---------------------------------------------------------------------------
+// Edwards25519 group: -x^2 + y^2 = 1 + d x^2 y^2
+
+struct ge_p2 { int X[10]; int Y[10]; int Z[10]; };              // x = X/Z, y = Y/Z
+struct ge_p3 { int X[10]; int Y[10]; int Z[10]; int T[10]; };   // also XY = ZT
+struct ge_p1p1 { int X[10]; int Y[10]; int Z[10]; int T[10]; }; // x = X/Z, y = Y/T
+struct ge_precomp { int yplusx[10]; int yminusx[10]; int xy2d[10]; };
+
+void ge_p1p1_to_p2(out ge_p2 r, ge_p1p1 p) {
+    fe_mul(r.X, p.X, p.T);
+    fe_mul(r.Y, p.Y, p.Z);
+    fe_mul(r.Z, p.Z, p.T);
+}
+
+void ge_p1p1_to_p3(out ge_p3 r, ge_p1p1 p) {
+    fe_mul(r.X, p.X, p.T);
+    fe_mul(r.Y, p.Y, p.Z);
+    fe_mul(r.Z, p.Z, p.T);
+    fe_mul(r.T, p.X, p.Y);
+}
+
+void ge_p2_dbl(out ge_p1p1 r, ge_p2 p) {
+    int t0[10];
+    fe_sq(r.X, p.X);
+    fe_sq(r.Z, p.Y);
+    fe_sq2(r.T, p.Z);
+    fe_add(r.Y, p.X, p.Y);
+    fe_sq(t0, r.Y);
+    fe_add(r.Y, r.Z, r.X);
+    fe_sub(r.Z, r.Z, r.X);
+    fe_sub(r.X, t0, r.Y);
+    fe_sub(r.T, r.T, r.Z);
+}
+
+void ge_madd(out ge_p1p1 r, ge_p3 p, ge_precomp q) {
+    int t0[10];
+    fe_add(r.X, p.Y, p.X);
+    fe_sub(r.Y, p.Y, p.X);
+    fe_mul(r.Z, r.X, q.yplusx);
+    fe_mul(r.Y, r.Y, q.yminusx);
+    fe_mul(r.T, q.xy2d, p.T);
+    fe_add(t0, p.Z, p.Z);
+    fe_sub(r.X, r.Z, r.Y);
+    fe_add(r.Y, r.Z, r.Y);
+    fe_add(r.Z, t0, r.T);
+    fe_sub(r.T, t0, r.T);
+}
+
+// Fixed-base scalar multiplication with signed radix-2^W digits.
+//
+// The clamp clears bits 0..2, so a*B = a'*(8B) with a' = a >> 3 and
+// 2^251 <= a' < 2^252. a' is recoded into M = ceil(252/W) signed digits e_k in
+// [-HALF, HALF-1] plus a constant top carry c_M (1 iff W divides 252):
+//     a' = sum_{k<M} e_k 2^(W k) + c_M 2^(W M)
+// The biased digit e_k + HALF is field k (bits W k .. W k + W - 1) of
+// y = a' + C, where C = sum_k HALF 2^(W k) has bits W-1, 2W-1, ... set.
+//
+// T = 1: one pass, digit k uses row k (multiplier 2^(W k) 8B), no doublings.
+// T = 2: ref10's trick: odd digits first with row (k-1)/2, then W doublings,
+//        then even digits with row k/2; rows have multiplier 2^(2 W i) 8B.
+// The first digit of the first pass needs no addition: it indexes the start
+// table S[f] = c_M 2^(3 + W (M - T + 1)) B + (f - HALF) 8B, stored as affine
+// (x, y, x*y), which also absorbs the constant top carry.
+//
+// Table layout (baseTable in vulkan.go), 32 ints = 128 bytes per entry:
+//   entries [0, 2^W)              start table, indexed by the biased field f
+//   entry 2^W + i (HALF+1) + j    row i, j = 0..HALF: j * 2^(T W i) * 8B as
+//                                 (y+x, y-x, 2dxy); j = 0 is the identity.
+
+layout(constant_id = 1) const uint W = 8u; // window bits (gpuConfig.window)
+layout(constant_id = 2) const uint T = 1u; // interleave (gpuConfig.interleave)
+
+const uint HALF = 1u << (W - 1u);
+const uint MASK = (1u << W) - 1u;
+const uint M = (252u + W - 1u) / W;   // digits of a >> 3
+const uint N_FIRST = M / T;           // digits in the first pass (k = T-1, 2T-1, ...)
+const uint N_EVEN = (M + 1u) / 2u;    // digits in the even pass (T == 2 only)
+const uint START_ENTRIES = 1u << W;
+const uint ROW_ENTRIES = HALF + 1u;
+const uint STEP = T * W;              // shift per consumed digit, < 32
+
+// Word j of the bias C. Q has its bits at the positions congruent to 32 mod W;
+// C_WORD rotates that pattern to residue W-1-(32j mod W).
+const uint Q = 0xffffffffu / MASK;
+const uint R32 = 32u % W;
+#define C_SHIFT(j) ((W - 1u - ((32u * (j)) % W) + W - R32) % W)
+#define C_WORD(j) ((Q << C_SHIFT(j)) | (Q >> (W - C_SHIFT(j))))
+
+// v >>= s for a 256-bit value in two uvec4 (little-endian words), 0 < s < 32.
+void shr256(inout uvec4 lo, inout uvec4 hi, uint s) {
+    lo = (lo >> s) | (uvec4(lo.yzw, hi.x) << (32u - s));
+    hi = (hi >> s) | (uvec4(hi.yzw, 0u) << (32u - s));
+}
+
+uint addc(uint x, uint y, inout uint carry) {
+    uint c1, c2;
+    uint s = uaddCarry(x, y, c1);
+    s = uaddCarry(s, carry, c2);
+    carry = c1 + c2;
+    return s;
+}
+
+// Loads table entry e (three field elements) with eight 16-byte loads.
+void load_entry(out int f0[10], out int f1[10], out int f2[10], uint e) {
+    uint o = 8u * e;
+    ivec4 v0 = base_table[o], v1 = base_table[o + 1u], v2 = base_table[o + 2u], v3 = base_table[o + 3u];
+    ivec4 v4 = base_table[o + 4u], v5 = base_table[o + 5u], v6 = base_table[o + 6u], v7 = base_table[o + 7u];
+    f0 = int[10](v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w, v2.x, v2.y);
+    f1 = int[10](v2.z, v2.w, v3.x, v3.y, v3.z, v3.w, v4.x, v4.y, v4.z, v4.w);
+    f2 = int[10](v5.x, v5.y, v5.z, v5.w, v6.x, v6.y, v6.z, v6.w, v7.x, v7.y);
+}
+
+// t = (f - HALF) * row multiplier, for a biased digit f in [0, 2^W).
+void select_point(out ge_precomp t, uint row, uint f) {
+    int e = int(f) - int(HALF);
+    load_entry(t.yplusx, t.yminusx, t.xy2d, START_ENTRIES + row * ROW_ENTRIES + uint(abs(e)));
+    if (e < 0) {
+        int tmp[10] = t.yplusx;
+        t.yplusx = t.yminusx;
+        t.yminusx = tmp;
+        [[unroll]] for (int i = 0; i < 10; i++) t.xy2d[i] = -t.xy2d[i];
+    }
+}
+
+void add_digit(inout ge_p3 h, uint row, uint f) {
+    ge_precomp t;
+    ge_p1p1 r;
+    select_point(t, row, f);
+    ge_madd(r, h, t);
+    ge_p1p1_to_p3(h, r);
+}
+
+// h = a * B for a clamped little-endian scalar a (bits 0..2 clear, bit 254 set, bit 255 clear).
+void ge_scalarmult_base(out ge_p3 h, uint a[8]) {
+    uvec4 lo = uvec4(a[0], a[1], a[2], a[3]), hi = uvec4(a[4], a[5], a[6], a[7]);
+    shr256(lo, hi, 3u);
+    uint c = 0u;
+    uvec4 ylo, yhi;
+    ylo.x = addc(lo.x, C_WORD(0u), c);
+    ylo.y = addc(lo.y, C_WORD(1u), c);
+    ylo.z = addc(lo.z, C_WORD(2u), c);
+    ylo.w = addc(lo.w, C_WORD(3u), c);
+    yhi.x = addc(hi.x, C_WORD(4u), c);
+    yhi.y = addc(hi.y, C_WORD(5u), c);
+    yhi.z = addc(hi.z, C_WORD(6u), c);
+    yhi.w = addc(hi.w, C_WORD(7u), c);
+
+    lo = ylo;
+    hi = yhi;
+    if (T == 2u) shr256(lo, hi, W); // first pass: odd digits
+
+    load_entry(h.X, h.Y, h.T, lo.x & MASK); // start table, affine (x, y, xy)
+    fe_1(h.Z);
+    shr256(lo, hi, STEP);
+    for (uint i = 1u; i < N_FIRST; i++) {
+        add_digit(h, i, lo.x & MASK);
+        shr256(lo, hi, STEP);
+    }
+
+    if (T == 2u) {
+        ge_p1p1 r;
+        ge_p2 s = ge_p2(h.X, h.Y, h.Z);
+        for (uint d = 1u; d < W; d++) {
+            ge_p2_dbl(r, s);
+            ge_p1p1_to_p2(s, r);
+        }
+        ge_p2_dbl(r, s);
+        ge_p1p1_to_p3(h, r);
+
+        lo = ylo;
+        hi = yhi;
+        for (uint i = 0u; i < N_EVEN; i++) {
+            add_digit(h, i, lo.x & MASK);
+            shr256(lo, hi, STEP);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-512 of a single 32-byte message (one padded block)
+
+const uint64_t SHA512_K[80] = uint64_t[80](
+    0x428a2f98d728ae22UL, 0x7137449123ef65cdUL, 0xb5c0fbcfec4d3b2fUL, 0xe9b5dba58189dbbcUL,
+    0x3956c25bf348b538UL, 0x59f111f1b605d019UL, 0x923f82a4af194f9bUL, 0xab1c5ed5da6d8118UL,
+    0xd807aa98a3030242UL, 0x12835b0145706fbeUL, 0x243185be4ee4b28cUL, 0x550c7dc3d5ffb4e2UL,
+    0x72be5d74f27b896fUL, 0x80deb1fe3b1696b1UL, 0x9bdc06a725c71235UL, 0xc19bf174cf692694UL,
+    0xe49b69c19ef14ad2UL, 0xefbe4786384f25e3UL, 0x0fc19dc68b8cd5b5UL, 0x240ca1cc77ac9c65UL,
+    0x2de92c6f592b0275UL, 0x4a7484aa6ea6e483UL, 0x5cb0a9dcbd41fbd4UL, 0x76f988da831153b5UL,
+    0x983e5152ee66dfabUL, 0xa831c66d2db43210UL, 0xb00327c898fb213fUL, 0xbf597fc7beef0ee4UL,
+    0xc6e00bf33da88fc2UL, 0xd5a79147930aa725UL, 0x06ca6351e003826fUL, 0x142929670a0e6e70UL,
+    0x27b70a8546d22ffcUL, 0x2e1b21385c26c926UL, 0x4d2c6dfc5ac42aedUL, 0x53380d139d95b3dfUL,
+    0x650a73548baf63deUL, 0x766a0abb3c77b2a8UL, 0x81c2c92e47edaee6UL, 0x92722c851482353bUL,
+    0xa2bfe8a14cf10364UL, 0xa81a664bbc423001UL, 0xc24b8b70d0f89791UL, 0xc76c51a30654be30UL,
+    0xd192e819d6ef5218UL, 0xd69906245565a910UL, 0xf40e35855771202aUL, 0x106aa07032bbd1b8UL,
+    0x19a4c116b8d2d0c8UL, 0x1e376c085141ab53UL, 0x2748774cdf8eeb99UL, 0x34b0bcb5e19b48a8UL,
+    0x391c0cb3c5c95a63UL, 0x4ed8aa4ae3418acbUL, 0x5b9cca4f7763e373UL, 0x682e6ff3d6b2b8a3UL,
+    0x748f82ee5defb2fcUL, 0x78a5636f43172f60UL, 0x84c87814a1f0ab72UL, 0x8cc702081a6439ecUL,
+    0x90befffa23631e28UL, 0xa4506cebde82bde9UL, 0xbef9a3f7b2c67915UL, 0xc67178f2e372532bUL,
+    0xca273eceea26619cUL, 0xd186b8c721c0c207UL, 0xeada7dd6cde0eb1eUL, 0xf57d4f7fee6ed178UL,
+    0x06f067aa72176fbaUL, 0x0a637dc5a2c898a6UL, 0x113f9804bef90daeUL, 0x1b710b35131c471bUL,
+    0x28db77f523047d84UL, 0x32caab7b40c72493UL, 0x3c9ebe0a15c9bebcUL, 0x431d67c49c100d4cUL,
+    0x4cc5d4becb3e42b6UL, 0x597f299cfc657e2aUL, 0x5fcb6fab3ad6faecUL, 0x6c44198c4a475817UL);
+
+const uint64_t SHA512_IV[8] = uint64_t[8](
+    0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL, 0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL,
+    0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL, 0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL);
+
+const uint64_t SHA512_256_IV[8] = uint64_t[8](
+    0x22312194fc2bf72cUL, 0x9f555fa3c84c64c2UL, 0x2393b86b6f53b151UL, 0x963877195940eabdUL,
+    0x96283ee2a88effe3UL, 0xbe5e1e2553863992UL, 0x2b0199fc2c85b8aaUL, 0x0eb72ddc81c52ca2UL);
+
+// 64-bit rotate and shift by a constant, built from 32-bit funnel shifts
+// (v_alignbit on AMD, SHF on NVIDIA) rather than 64-bit shifts.
+uint64_t rotr64(uint64_t x, uint n) {
+    uvec2 v = unpack32(x); // (lo, hi)
+    if (n >= 32u) {
+        v = v.yx;
+        n -= 32u;
+    }
+    if (n == 0u) return pack64(v);
+    return pack64(uvec2((v.x >> n) | (v.y << (32u - n)), (v.y >> n) | (v.x << (32u - n))));
+}
+
+uint64_t shr64(uint64_t x, uint n) { // 0 < n < 32
+    uvec2 v = unpack32(x);
+    return pack64(uvec2((v.x >> n) | (v.y << (32u - n)), v.y >> n));
+}
+
+uint bswap32(uint x) {
+    return (x >> 24) | ((x >> 8) & 0xff00u) | ((x << 8) & 0xff0000u) | (x << 24);
+}
+
+// Big-endian 64-bit word from two little-endian 32-bit words (8 message bytes).
+uint64_t be64(uint lo, uint hi) {
+    return (uint64_t(bswap32(lo)) << 32) | uint64_t(bswap32(hi));
+}
+
+// msg is the 32-byte message as little-endian words.
+void sha512_32(out uint64_t digest[8], uint msg[8], uint64_t iv[8]) {
+    uint64_t w[16];
+    [[unroll]] for (int i = 0; i < 4; i++) w[i] = be64(msg[2 * i], msg[2 * i + 1]);
+    w[4] = 0x8000000000000000UL;
+    [[unroll]] for (int i = 5; i < 15; i++) w[i] = 0UL;
+    w[15] = 256UL; // message length in bits
+
+    uint64_t a = iv[0], b = iv[1], c = iv[2], d = iv[3];
+    uint64_t e = iv[4], f = iv[5], g = iv[6], h = iv[7];
+    [[unroll]] for (int t = 0; t < 80; t++) {
+        if (t >= 16) {
+            uint64_t s0 = w[(t + 1) & 15];
+            uint64_t s1 = w[(t + 14) & 15];
+            w[t & 15] += (rotr64(s0, 1u) ^ rotr64(s0, 8u) ^ shr64(s0, 7u)) + w[(t + 9) & 15] +
+                         (rotr64(s1, 19u) ^ rotr64(s1, 61u) ^ shr64(s1, 6u));
+        }
+        uint64_t t1 = h + (rotr64(e, 14u) ^ rotr64(e, 18u) ^ rotr64(e, 41u)) + ((e & f) ^ (~e & g)) + SHA512_K[t] + w[t & 15];
+        uint64_t t2 = (rotr64(a, 28u) ^ rotr64(a, 34u) ^ rotr64(a, 39u)) + ((a & b) ^ (a & c) ^ (b & c));
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    digest[0] = iv[0] + a; digest[1] = iv[1] + b; digest[2] = iv[2] + c; digest[3] = iv[3] + d;
+    digest[4] = iv[4] + e; digest[5] = iv[5] + f; digest[6] = iv[6] + g; digest[7] = iv[7] + h;
+}
+
+// ---------------------------------------------------------------------------
+// ChaCha20 (RFC 8439 block function), used as the seed generator
+
+uvec4 rotl32(uvec4 v, uint n) { return (v << n) | (v >> (32u - n)); }
+
+void chacha_quarter(inout uvec4 a, inout uvec4 b, inout uvec4 c, inout uvec4 d) {
+    a += b; d ^= a; d = rotl32(d, 16u);
+    c += d; b ^= c; b = rotl32(b, 12u);
+    a += b; d ^= a; d = rotl32(d, 8u);
+    c += d; b ^= c; b = rotl32(b, 7u);
+}
+
+// First 32 bytes of the keystream block for candidate idx, as little-endian words.
+void chacha20_seed(out uint seed[8], uint64_t idx) {
+    uvec4 s0 = uvec4(0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u);
+    uvec4 s1 = uvec4(key[0], key[1], key[2], key[3]);
+    uvec4 s2 = uvec4(key[4], key[5], key[6], key[7]);
+    uvec4 s3 = uvec4(uint(idx), uint(idx >> 32), nonce[0], nonce[1]);
+    uvec4 a = s0, b = s1, c = s2, d = s3;
+    for (int i = 0; i < 10; i++) {
+        chacha_quarter(a, b, c, d); // columns
+        b = b.yzwx; c = c.zwxy; d = d.wxyz;
+        chacha_quarter(a, b, c, d); // diagonals
+        b = b.wxyz; c = c.zwxy; d = d.yzwx;
+    }
+    a += s0;
+    b += s1;
+    seed[0] = a.x; seed[1] = a.y; seed[2] = a.z; seed[3] = a.w;
+    seed[4] = b.x; seed[5] = b.y; seed[6] = b.z; seed[7] = b.w;
+}
+
+// ---------------------------------------------------------------------------
+// Address derivation and matching
+
+// Candidates per invocation and loop iteration that share one field
+// inversion (Montgomery's trick); set by the host (gpuConfig.batch).
+layout(constant_id = 3) const int BATCH = 1;
+
+// Seed -> clamped scalar -> scalar * B in projective coordinates.
+void derive_point(out ge_p2 r, uint64_t idx) {
+    uint seed[8];
+    chacha20_seed(seed, idx);
+
+    uint64_t hs[8];
+    sha512_32(hs, seed, SHA512_IV);
+    uint a[8];
+    [[unroll]] for (int i = 0; i < 4; i++) {
+        a[2 * i] = bswap32(uint(hs[i] >> 32));
+        a[2 * i + 1] = bswap32(uint(hs[i]));
+    }
+    a[0] &= 0xfffffff8u;
+    a[7] = (a[7] & 0x3fffffffu) | 0x40000000u;
+
+    ge_p3 p;
+    ge_scalarmult_base(p, a);
+    r = ge_p2(p.X, p.Y, p.Z);
+}
+
+// The 36 address bytes (public key || checksum) of the affine point (x, y) as
+// little-endian words; w[9] is zero so that reading one byte past the end is
+// harmless.
+void encode_address(out uint w[10], int x[10], int y[10], bool with_checksum) {
+    uint xw[8], pk[8];
+    fe_pack(xw, x);
+    fe_pack(pk, y);
+    pk[7] |= (xw[0] & 1u) << 31;
+
+    [[unroll]] for (int i = 0; i < 8; i++) w[i] = pk[i];
+    w[8] = 0u;
+    w[9] = 0u;
+    if (with_checksum) {
+        uint64_t hc[8];
+        sha512_32(hc, pk, SHA512_256_IV);
+        w[8] = bswap32(uint(hc[3])); // digest bytes 28..31
+    }
+}
+
+// Base32 symbol k (0..57) of the address.
+uint symbol_at(uint w[10], uint k) {
+    uint bit = k * 5u;
+    uint i = bit >> 3;
+    uint hi = (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+    uint j = i + 1u;
+    uint lo = (w[j >> 2] >> ((j & 3u) * 8u)) & 0xffu;
+    return (((hi << 8) | lo) >> (11u - (bit & 7u))) & 31u;
+}
+
+bool match_at(uint w[10], uint start) {
+    for (uint k = 0u; k < pattern_len; k++) {
+        if (symbol_at(w, start + k) != pattern[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool matches(uint w[10]) {
+    if (search_type == SEARCH_ENDS) {
+        return match_at(w, ADDRESS_SYMBOLS - pattern_len);
+    }
+    if (search_type == SEARCH_CONTAINS) {
+        for (uint s = 0u; s + pattern_len <= ADDRESS_SYMBOLS; s++) {
+            if (match_at(w, s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return match_at(w, 0u); // SEARCH_STARTS, and SEARCH_EXACT with a full-length pattern
+}
+
+void report(uint64_t offset, uint64_t idx, uint w[10]) {
+    if (mode == MODE_DUMP) {
+        uint o = uint(offset) * 9u;
+        [[unroll]] for (int i = 0; i < 9; i++) dump[o + uint(i)] = w[i];
+    } else if (matches(w)) {
+        uint slot = atomicAdd(hit_count, 1u);
+        if (slot < max_hits) {
+            hits[slot] = uvec2(uint(idx), uint(idx >> 32));
+        }
+    }
+}
+
+void main() {
+    uint64_t base = (uint64_t(pc.base_hi) << 32) | uint64_t(pc.base_lo);
+    uint64_t stride = uint64_t(gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+    uint64_t gid = uint64_t(gl_GlobalInvocationID.x);
+    bool with_checksum = mode == MODE_DUMP || search_type != SEARCH_STARTS || pattern_len > PUBKEY_SYMBOLS;
+
+    for (uint it = 0u; it < pc.iterations; it++) {
+        // Candidate k of this batch has offset (it*BATCH + k)*stride + gid: the
+        // same candidates as BATCH = 1 with BATCH times as many iterations.
+        uint64_t first = uint64_t(it) * uint64_t(BATCH) * stride + gid;
+
+        // BATCH scalar multiplications. pend is shifted down after each one so
+        // that every index is a compile-time constant and it stays in registers.
+        ge_p2 pend[BATCH];
+        for (int k = 0; k < BATCH; k++) {
+            ge_p2 p;
+            derive_point(p, base + first + uint64_t(k) * stride);
+            [[unroll]] for (int j = 0; j + 1 < BATCH; j++) pend[j] = pend[j + 1];
+            pend[BATCH - 1] = p;
+        }
+
+        // One inversion for the batch: acc[k] = Z_0 * ... * Z_k, then walk back.
+        // Z is never zero: the twisted Edwards formulas are complete.
+        int acc[BATCH][10];
+        acc[0] = pend[0].Z;
+        [[unroll]] for (int k = 1; k < BATCH; k++) fe_mul(acc[k], acc[k - 1], pend[k].Z);
+        int inv[10];
+        fe_invert(inv, acc[BATCH - 1]);
+        [[unroll]] for (int k = BATCH - 1; k >= 0; k--) {
+            int zinv[10];
+            if (k > 0) {
+                fe_mul(zinv, inv, acc[k - 1]); // 1 / Z_k
+                fe_mul(inv, inv, pend[k].Z);   // 1 / (Z_0 ... Z_{k-1})
+            } else {
+                zinv = inv;
+            }
+            fe_mul(pend[k].X, pend[k].X, zinv);
+            fe_mul(pend[k].Y, pend[k].Y, zinv);
+        }
+
+        for (int k = 0; k < BATCH; k++) {
+            uint w[10];
+            encode_address(w, pend[0].X, pend[0].Y, with_checksum);
+            [[unroll]] for (int j = 0; j + 1 < BATCH; j++) pend[j] = pend[j + 1];
+            uint64_t offset = first + uint64_t(k) * stride;
+            report(offset, base + offset, w);
+        }
+    }
+}
